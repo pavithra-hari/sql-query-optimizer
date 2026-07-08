@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SQL Query Optimizer</title>
+    <link rel="stylesheet" href="sql-optimizer.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace" aria-label="SQL optimizer workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Query Lab</p>
+            <h1>SQL Query Optimizer</h1>
+          </div>
+          <div class="toolbar" role="group" aria-label="Optimizer actions">
+            <select id="dialect" aria-label="SQL dialect">
+              <option value="postgres">PostgreSQL</option>
+              <option value="mysql">MySQL</option>
+              <option value="sqlserver">SQL Server</option>
+              <option value="sqlite">SQLite</option>
+            </select>
+            <button id="loadSample" type="button" title="Load sample query">
+              <span class="icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13.5 8A5.5 5.5 0 1 1 11.6 3.9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M13.5 3.5V7h-3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              Sample
+            </button>
+            <button id="saveRun" type="button" title="Save this optimization run">
+              <span class="icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M8 2.5v11M2.5 8h11" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></span>
+              Save
+            </button>
+            <button id="optimize" class="primary" type="button" title="Optimize SQL query">
+              <span class="icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M8.8 1.5 3 9.2h3.6L6.2 14.5 13 6.4H9.2L8.8 1.5Z" fill="currentColor"/></svg></span>
+              Optimize
+            </button>
+          </div>
+        </header>
+
+        <section class="editor-grid">
+          <div class="panel editor-panel">
+            <div class="panel-head">
+              <h2>Query</h2>
+              <span id="queryStats">0 lines</span>
+            </div>
+            <textarea id="sqlInput" spellcheck="false" aria-label="SQL query input"></textarea>
+          </div>
+
+          <div class="panel schema-panel">
+            <div class="panel-head">
+              <h2>Schema & Notes</h2>
+              <span>optional</span>
+            </div>
+            <textarea id="schemaInput" spellcheck="false" aria-label="Schema and table notes"></textarea>
+          </div>
+        </section>
+
+        <section class="assist-grid">
+          <div class="panel builder-panel">
+            <div class="panel-head">
+              <h2>Describe Query</h2>
+              <button id="buildQuery" type="button" title="Generate SQL from description">
+                <span class="icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M10.6 2.4 13.6 5.4 5.6 13.4 2.2 13.8l0.4-3.4 8-8Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M9.2 3.8 12.2 6.8" stroke="currentColor" stroke-width="1.3"/></svg></span>
+                Build
+              </button>
+            </div>
+            <textarea
+              id="intentInput"
+              spellcheck="true"
+              aria-label="Describe the query you want"
+              placeholder="Example: Show each customer and their total order value for completed orders in 2025, highest spenders first, only top 20."
+            ></textarea>
+          </div>
+
+          <div class="panel explain-panel">
+            <div class="panel-head">
+              <h2>EXPLAIN Plan</h2>
+              <button id="analyzeExplain" type="button" title="Analyze pasted EXPLAIN plan">
+                <span class="icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="M10.3 10.3 13.5 13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></span>
+                Analyze
+              </button>
+            </div>
+            <textarea
+              id="explainInput"
+              spellcheck="false"
+              aria-label="EXPLAIN plan input"
+              placeholder="Paste EXPLAIN or EXPLAIN ANALYZE output here for deeper complex-query diagnostics."
+            ></textarea>
+          </div>
+        </section>
+
+        <section class="results-grid" aria-live="polite">
+          <div class="panel score-panel">
+            <div class="score-ring" id="scoreRing">
+              <strong id="scoreValue">--</strong>
+              <span>score</span>
+            </div>
+            <div class="score-copy">
+              <h2 id="scoreTitle">Ready to inspect</h2>
+              <p id="scoreText">Paste a query, add schema details if you have them, then run the optimizer.</p>
+            </div>
+          </div>
+
+          <div class="panel metrics-panel">
+            <div class="metric">
+              <span>Estimated Cost</span>
+              <strong id="costMetric">--</strong>
+            </div>
+            <div class="metric">
+              <span>Risk Flags</span>
+              <strong id="riskMetric">--</strong>
+            </div>
+            <div class="metric">
+              <span>Index Ideas</span>
+              <strong id="indexMetric">--</strong>
+            </div>
+          </div>
+
+          <div class="panel output-panel">
+            <div class="panel-head">
+              <h2>Optimized Query</h2>
+              <button id="copyOutput" type="button" title="Copy optimized query">
+                <span class="icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="5.5" y="5.5" width="8" height="8" rx="1.3" stroke="currentColor" stroke-width="1.3"/><path d="M3.5 10.2V3.8A1.3 1.3 0 0 1 4.8 2.5h6.4" stroke="currentColor" stroke-width="1.3"/></svg></span>
+                Copy
+              </button>
+            </div>
+            <pre id="optimizedOutput">Your optimized SQL will appear here.</pre>
+          </div>
+
+          <div class="panel recommendations-panel">
+            <div class="tabs" role="tablist" aria-label="Recommendation categories">
+              <button class="tab active" data-tab="findings" type="button">Findings</button>
+              <button class="tab" data-tab="indexes" type="button">Indexes</button>
+              <button class="tab" data-tab="plan" type="button">Plan</button>
+              <button class="tab" data-tab="explain" type="button">EXPLAIN</button>
+              <button class="tab" data-tab="tree" type="button">Tree</button>
+              <button class="tab" data-tab="diff" type="button">Diff</button>
+              <button class="tab" data-tab="breakdown" type="button">Score</button>
+              <button class="tab" data-tab="history" type="button">History</button>
+            </div>
+            <div id="tabContent" class="tab-content"></div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="sql-optimizer.js"></script>
+  </body>
+</html>
