@@ -42,9 +42,16 @@ predicates, `NOT IN`, leading-wildcard `LIKE`, unbounded sorts, etc. — is
 flagged with an explanation but left for you to fix manually, since rewriting
 those safely requires understanding intent the tool doesn't have.
 
-The dialect selector (Postgres/MySQL/SQL Server/SQLite) currently only
-labels the session; it doesn't yet change analysis rules or generated SQL
-per-dialect.
+The dialect selector (Postgres/MySQL/SQL Server/SQLite) adjusts some analysis
+and generated SQL: date-extraction rewrites recognize each dialect's idiom
+(`EXTRACT(YEAR FROM ...)` for Postgres, `strftime('%Y', ...)` for SQLite,
+`YEAR(...)` for MySQL/SQL Server), suggested `CREATE INDEX` statements use
+each engine's non-locking syntax where available (`CONCURRENTLY` on
+Postgres, `ALGORITHM=INPLACE, LOCK=NONE` on MySQL, `WITH (ONLINE = ON)` on
+SQL Server), and the leading-wildcard `LIKE` finding recommends the
+matching full-text option (pg_trgm, FULLTEXT, Full-Text Search, FTS5). Other
+checks (missing WHERE, NOT IN, unbounded sorts, join predicates) remain
+dialect-agnostic since the underlying risk is the same across engines.
 
 ## Files
 

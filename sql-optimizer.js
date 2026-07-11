@@ -231,7 +231,7 @@ function analyzeSql(rawSql, schema, dialect) {
     pushFinding(report, "high", "Missing WHERE filter", "A broad scan can be expensive and risky on large tables.");
   }
 
-  if (/\blower\s*\(|\bupper\s*\(|\bdate\s*\(|\byear\s*\(|\bmonth\s*\(/i.test(sql)) {
+  if (/\blower\s*\(|\bupper\s*\(|\bdate\s*\(|\byear\s*\(|\bmonth\s*\(|\bextract\s*\(|\bstrftime\s*\(/i.test(sql)) {
     report.cost += 18;
     report.risks += 1;
     pushBreakdown(report, -18, "Function predicate", "Function-wrapped columns often block normal index access.");
@@ -243,12 +243,35 @@ function analyzeSql(rawSql, schema, dialect) {
     );
   }
 
-  if (/\byear\s*\(\s*([a-z_][\w]*\.[a-z_][\w]*)\s*\)\s*=\s*(\d{4})/i.test(sql)) {
-    report.optimized = report.optimized.replace(
-      /\byear\s*\(\s*([a-z_][\w]*\.[a-z_][\w]*)\s*\)\s*=\s*(\d{4})/gi,
-      (_, column, year) => `${column} >= '${year}-01-01' AND ${column} < '${Number(year) + 1}-01-01'`
-    );
-    pushPlan(report, "good", "Converted YEAR() predicate", "The rewrite uses a date range that can use a normal index.");
+  const dateExtractionRewrite = {
+    postgres: {
+      test: /\bextract\s*\(\s*year\s+from\s+[a-z_][\w]*\.[a-z_][\w]*\s*\)\s*=\s*\d{4}/i,
+      apply: (text) =>
+        text.replace(
+          /\bextract\s*\(\s*year\s+from\s+([a-z_][\w]*\.[a-z_][\w]*)\s*\)\s*=\s*(\d{4})/gi,
+          (_, column, year) => `${column} >= '${year}-01-01' AND ${column} < '${Number(year) + 1}-01-01'`
+        ),
+    },
+    sqlite: {
+      test: /\bstrftime\s*\(\s*'%Y'\s*,\s*[a-z_][\w]*\.[a-z_][\w]*\s*\)\s*=\s*'?\d{4}'?/i,
+      apply: (text) =>
+        text.replace(
+          /\bstrftime\s*\(\s*'%Y'\s*,\s*([a-z_][\w]*\.[a-z_][\w]*)\s*\)\s*=\s*'?(\d{4})'?/gi,
+          (_, column, year) => `${column} >= '${year}-01-01' AND ${column} < '${Number(year) + 1}-01-01'`
+        ),
+    },
+  }[dialect] || {
+    test: /\byear\s*\(\s*[a-z_][\w]*\.[a-z_][\w]*\s*\)\s*=\s*\d{4}/i,
+    apply: (text) =>
+      text.replace(
+        /\byear\s*\(\s*([a-z_][\w]*\.[a-z_][\w]*)\s*\)\s*=\s*(\d{4})/gi,
+        (_, column, year) => `${column} >= '${year}-01-01' AND ${column} < '${Number(year) + 1}-01-01'`
+      ),
+  };
+
+  if (dateExtractionRewrite.test.test(sql)) {
+    report.optimized = dateExtractionRewrite.apply(report.optimized);
+    pushPlan(report, "good", "Converted date-extraction predicate", "The rewrite uses a date range that can use a normal index.");
   }
 
   if (/\bnot\s+in\s*\(/i.test(sql)) {
@@ -268,7 +291,18 @@ function analyzeSql(rawSql, schema, dialect) {
     report.cost += 16;
     report.risks += 1;
     pushBreakdown(report, -16, "Leading wildcard", "A leading wildcard usually prevents b-tree index seeks.");
-    pushFinding(report, "high", "Leading wildcard search", "LIKE '%value' usually cannot use a standard b-tree index.");
+    const fullTextAlternative = {
+      postgres: "consider a trigram index (CREATE EXTENSION pg_trgm; CREATE INDEX ... USING GIN (col gin_trgm_ops))",
+      mysql: "consider a FULLTEXT index instead of LIKE for substring search",
+      sqlserver: "consider Full-Text Search (CREATE FULLTEXT INDEX) instead of LIKE for substring search",
+      sqlite: "consider an FTS5 virtual table instead of LIKE for substring search",
+    }[dialect] || "consider a full-text search index instead of LIKE for substring search";
+    pushFinding(
+      report,
+      "high",
+      "Leading wildcard search",
+      `LIKE '%value' usually cannot use a standard b-tree index; ${fullTextAlternative}.`
+    );
   }
 
   if (/\border\s+by\b/i.test(sql) && !/\blimit\b|\bfetch\s+first\b|\btop\s+\d+/i.test(sql)) {
@@ -354,8 +388,14 @@ function analyzeSql(rawSql, schema, dialect) {
 
 function indexStatement(table, column, dialect) {
   const name = `idx_${table}_${column}`.replace(/[^\w]/g, "_");
+  if (dialect === "postgres") {
+    return `CREATE INDEX CONCURRENTLY ${name} ON ${table} (${column}); -- run outside a transaction block`;
+  }
   if (dialect === "mysql") {
-    return `CREATE INDEX ${name} ON ${table} (${column});`;
+    return `CREATE INDEX ${name} ON ${table} (${column}) ALGORITHM=INPLACE, LOCK=NONE; -- requires InnoDB`;
+  }
+  if (dialect === "sqlserver") {
+    return `CREATE INDEX ${name} ON ${table} (${column}) WITH (ONLINE = ON); -- ONLINE requires Enterprise/Azure SQL`;
   }
   return `CREATE INDEX ${name} ON ${table} (${column});`;
 }
