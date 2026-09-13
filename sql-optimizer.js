@@ -100,11 +100,30 @@ const SQL_KEYWORDS = new Set([
   "or", "as", "set", "into", "values", "top", "by",
 ]);
 
+function parenDepthAt(sql, index) {
+  let depth = 0;
+  for (let i = 0; i < index; i += 1) {
+    if (sql[i] === "(") {
+      depth += 1;
+    } else if (sql[i] === ")") {
+      depth -= 1;
+    }
+  }
+  return depth;
+}
+
 function extractFromClause(sql) {
-  const match = sql.match(
-    /\bfrom\b([\s\S]*?)(?=\bjoin\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\blimit\b|\boffset\b|\bunion\b|$)/i
+  const fromMatches = [...sql.matchAll(/\bfrom\b/gi)];
+  const topLevelFrom = fromMatches.find((match) => parenDepthAt(sql, match.index) === 0);
+  if (!topLevelFrom) {
+    return "";
+  }
+
+  const rest = sql.slice(topLevelFrom.index + topLevelFrom[0].length);
+  const endMatch = rest.match(
+    /\bjoin\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\blimit\b|\boffset\b|\bunion\b/i
   );
-  return match ? match[1] : "";
+  return endMatch ? rest.slice(0, endMatch.index) : rest;
 }
 
 function tableAliases(sql) {
@@ -133,12 +152,17 @@ function tableAliases(sql) {
   return aliases;
 }
 
+function stripStringLiterals(sql) {
+  return sql.replace(/'(?:[^'\\]|\\.)*'/g, "''");
+}
+
 function detectColumns(sql) {
-  const aliases = tableAliases(sql);
+  const clean = stripStringLiterals(sql);
+  const aliases = tableAliases(clean);
   const columns = [];
   const pattern = /\b([a-z_][\w]*)\.([a-z_][\w]*)\b/gi;
   let match;
-  while ((match = pattern.exec(sql))) {
+  while ((match = pattern.exec(clean))) {
     columns.push({
       alias: match[1],
       table: aliases.get(match[1]) || match[1],
@@ -149,15 +173,64 @@ function detectColumns(sql) {
 }
 
 function existingIndexSet(schema) {
-  const found = new Set();
-  const pattern = /(?:index|indexes|idx|key)\s*[:\s(]+([a-z_][\w]*)\s*[,.)\s]+([a-z_][\w]*)?/gi;
-  let match;
-  while ((match = pattern.exec(schema))) {
-    if (match[1] && match[2]) {
-      found.add(`${match[1].toLowerCase()}.${match[2].toLowerCase()}`);
+  const singles = new Set();
+  const compounds = new Set();
+  let inIndexSection = false;
+
+  schema.split(/\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return;
     }
-  }
-  return found;
+
+    if (/^(?:existing\s+)?indexe?s?\s*:?$/i.test(trimmed)) {
+      inIndexSection = true;
+      return;
+    }
+
+    const tableColumns = trimmed.match(/^([a-z_][\w.]*)\s*\(([^)]+)\)/i);
+    if (inIndexSection && tableColumns) {
+      const table = tableColumns[1].split(".").pop().toLowerCase();
+      const cols = tableColumns[2]
+        .split(",")
+        .map((part) => part.trim().split(/\s+/)[0])
+        .filter(Boolean)
+        .map((col) => col.toLowerCase());
+      cols.forEach((col) => singles.add(`${table}.${col}`));
+      if (cols.length > 1) {
+        compounds.add(`${table}.${[...cols].sort().join("_")}`);
+      }
+      return;
+    }
+
+    const inline = trimmed.match(/^(?:idx|index|key)\b[:\s]*([a-z_][\w]*)[\s,]+([a-z_][\w]*)/i);
+    if (inline) {
+      singles.add(`${inline[1].toLowerCase()}.${inline[2].toLowerCase()}`);
+    }
+  });
+
+  return { singles, compounds };
+}
+
+function filterClauses(sql) {
+  const whereMatch = sql.match(
+    /\bwhere\b([\s\S]*?)(?=\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\blimit\b|\boffset\b|\bunion\b|$)/i
+  );
+  const onClauses = [...sql.matchAll(
+    /\bon\b([\s\S]*?)(?=\bjoin\b|\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\bhaving\b|\blimit\b|\boffset\b|\bunion\b|$)/gi
+  )].map((match) => match[1]);
+  const usingClauses = [...sql.matchAll(/\busing\s*\(([^)]*)\)/gi)].map((match) => match[1]);
+
+  return {
+    qualified: [whereMatch ? whereMatch[1] : "", ...onClauses].join(" "),
+    bare: usingClauses.join(" "),
+  };
+}
+
+function appearsInFilter(alias, column, clauses) {
+  const qualifiedPattern = new RegExp(`\\b${alias}\\.${column}\\b`, "i");
+  const barePattern = new RegExp(`\\b${column}\\b`, "i");
+  return qualifiedPattern.test(clauses.qualified) || barePattern.test(clauses.bare);
 }
 
 function pushFinding(report, severity, title, body) {
@@ -177,7 +250,7 @@ function pushBreakdown(report, impact, title, body) {
   });
 }
 
-function analyzeSql(rawSql, schema, dialect) {
+function analyzeSql(rawSql, schema, dialect, explainText) {
   const report = {
     findings: [],
     indexes: [],
@@ -192,11 +265,12 @@ function analyzeSql(rawSql, schema, dialect) {
     original: rawSql.trim(),
     optimized: rawSql.trim(),
   };
+  pushBreakdown(report, -20, "Baseline cost", "Every query carries a baseline analysis cost before specific findings are applied.");
 
   const sql = normalizeWhitespace(rawSql);
   const columns = detectColumns(sql);
   const existingIndexes = existingIndexSet(schema);
-  const explainFindings = analyzeExplain(explainInput.value);
+  const explainFindings = analyzeExplain(explainText);
   report.explain.push(...explainFindings.items);
   report.tree.push(...explainFindings.nodes);
   report.cost += explainFindings.cost;
@@ -206,6 +280,7 @@ function analyzeSql(rawSql, schema, dialect) {
   if (!sql) {
     pushFinding(report, "medium", "No query entered", "Paste a SELECT, UPDATE, INSERT, or DELETE statement to analyze.");
     report.optimized = "No SQL query provided.";
+    report.cost = Math.max(10, Math.min(100, report.cost));
     report.diff = buildDiff(report.original, report.optimized);
     report.history = readHistory();
     return report;
@@ -330,11 +405,11 @@ function analyzeSql(rawSql, schema, dialect) {
     );
   }
 
+  const clauses = filterClauses(sql);
   const indexCandidates = new Map();
-  columns.forEach(({ table, column }) => {
+  columns.forEach(({ alias, table, column }) => {
     const columnRef = `${table}.${column}`.toLowerCase();
-    const appearsInFilter = new RegExp(`\\b(where|and|or|on)\\b[^;]*\\b${column}\\b`, "i").test(sql);
-    if (appearsInFilter && !existingIndexes.has(columnRef)) {
+    if (appearsInFilter(alias, column, clauses) && !existingIndexes.singles.has(columnRef)) {
       indexCandidates.set(columnRef, { table, column });
     }
   });
@@ -356,11 +431,12 @@ function analyzeSql(rawSql, schema, dialect) {
 
   const compoundCandidates = compoundIndexCandidates(sql, columns, existingIndexes, dialect);
   if (compoundCandidates.length) {
-    report.cost -= Math.min(15, compoundCandidates.length * 5);
+    const compoundBonus = Math.min(15, compoundCandidates.length * 5);
+    report.cost -= compoundBonus;
+    pushBreakdown(report, compoundBonus, "Compound index candidates", "A multi-column index may match filter plus sort/join access better than single-column indexes.");
   }
   compoundCandidates.forEach((index) => {
     report.indexes.unshift(index);
-    pushBreakdown(report, 10, "Compound index candidate", "A multi-column index may match filter plus sort/join access better than single-column indexes.");
   });
 
   if (!report.findings.length) {
@@ -387,7 +463,7 @@ function analyzeSql(rawSql, schema, dialect) {
 }
 
 function indexStatement(table, column, dialect) {
-  const name = `idx_${table}_${column}`.replace(/[^\w]/g, "_");
+  const name = `idx_${table}_${column}`.replace(/[^\w]+/g, "_").replace(/_$/, "");
   if (dialect === "postgres") {
     return `CREATE INDEX CONCURRENTLY ${name} ON ${table} (${column}); -- run outside a transaction block`;
   }
@@ -402,19 +478,23 @@ function indexStatement(table, column, dialect) {
 
 function compoundIndexCandidates(sql, columns, existingIndexes, dialect) {
   const byTable = new Map();
-  const lowered = sql.toLowerCase();
-  columns.forEach(({ table, column }) => {
+  const clauses = filterClauses(sql);
+  columns.forEach(({ alias, table, column }) => {
     if (!byTable.has(table)) {
       byTable.set(table, new Set());
     }
-    if (new RegExp(`\\b(where|and|or|on)\\b[^;]*\\b${column}\\b`, "i").test(sql)) {
+    if (appearsInFilter(alias, column, clauses)) {
       byTable.get(table).add(column);
     }
   });
 
-  const orderMatch = lowered.match(/\border\s+by\s+([a-z_][\w]*)\.([a-z_][\w]*)/i);
-  if (orderMatch && byTable.has(orderMatch[1])) {
-    byTable.get(orderMatch[1]).add(orderMatch[2]);
+  const aliasToTable = tableAliases(sql);
+  const orderMatch = sql.match(/\border\s+by\s+([a-z_][\w]*)\.([a-z_][\w]*)/i);
+  if (orderMatch) {
+    const orderTable = aliasToTable.get(orderMatch[1]) || orderMatch[1];
+    if (byTable.has(orderTable)) {
+      byTable.get(orderTable).add(orderMatch[2]);
+    }
   }
 
   return [...byTable.entries()]
@@ -422,9 +502,9 @@ function compoundIndexCandidates(sql, columns, existingIndexes, dialect) {
     .slice(0, 3)
     .map(([table, columnSet]) => {
       const compoundColumns = [...columnSet].slice(0, 3);
-      const key = `${table}.${compoundColumns.join("_")}`.toLowerCase();
+      const key = `${table}.${[...compoundColumns].sort().join("_")}`.toLowerCase();
       return {
-        severity: existingIndexes.has(key) ? "medium" : "good",
+        severity: existingIndexes.compounds.has(key) ? "medium" : "good",
         title: `${table} (${compoundColumns.join(", ")})`,
         body: indexStatement(table, compoundColumns.join(", "), dialect),
       };
@@ -464,17 +544,33 @@ function formatComparableSql(sql) {
 
 function parseSchemaTables(schema) {
   const tables = [];
-  const pattern = /^([a-z_][\w.]*)\s*\(([^)]+)\)/gim;
-  let match;
-  while ((match = pattern.exec(schema))) {
-    tables.push({
-      name: match[1].split(".").pop(),
-      columns: match[2]
-        .split(",")
-        .map((column) => column.trim().split(/\s+/)[0])
-        .filter(Boolean),
-    });
-  }
+  let inIndexSection = false;
+
+  schema.split(/\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return;
+    }
+    if (/^(?:existing\s+)?indexe?s?\s*:?$/i.test(trimmed)) {
+      inIndexSection = true;
+      return;
+    }
+    if (inIndexSection) {
+      return;
+    }
+
+    const match = trimmed.match(/^([a-z_][\w.]*)\s*\(([^)]+)\)/i);
+    if (match) {
+      tables.push({
+        name: match[1].split(".").pop(),
+        columns: match[2]
+          .split(",")
+          .map((column) => column.trim().split(/\s+/)[0])
+          .filter(Boolean),
+      });
+    }
+  });
+
   return tables;
 }
 
@@ -564,8 +660,10 @@ function buildSqlFromIntent(intent, schema, dialect) {
 
   if (/\bby customer|each customer|per customer\b/.test(lowered)) {
     const customerTable = tables.find((table) => table.name === "customers");
-    if (customerTable && primary.name !== "customers" && !joins.some((join) => join.includes("customers"))) {
-      joins.push(`JOIN customers ON ${primary.name}.customer_id = customers.id`);
+    if (customerTable && primary.name !== "customers") {
+      if (!joins.some((join) => join.includes("customers"))) {
+        joins.push(`JOIN customers ON ${primary.name}.customer_id = customers.id`);
+      }
       groupColumns.push("customers.id");
       selectColumns.unshift("customers.id");
       if (customerTable.columns.includes("email")) {
@@ -596,7 +694,12 @@ function buildSqlFromIntent(intent, schema, dialect) {
     limit = dialect === "sqlserver" ? "" : `LIMIT ${limitMatch[1] || limitMatch[2] || limitMatch[3]}`;
   }
 
-  const uniqueSelect = [...new Set(selectColumns)];
+  const hasAggregate = selectColumns.some((column) => /\b(?:SUM|COUNT|AVG|MIN|MAX)\s*\(/i.test(column));
+  const groupSet = new Set(groupColumns);
+  const finalSelectColumns = hasAggregate
+    ? selectColumns.filter((column) => /\b(?:SUM|COUNT|AVG|MIN|MAX)\s*\(/i.test(column) || groupSet.has(column))
+    : selectColumns;
+  const uniqueSelect = [...new Set(finalSelectColumns)];
   const sqlServerTop = dialect === "sqlserver" && limitMatch ? `TOP ${limitMatch[1] || limitMatch[2] || limitMatch[3]} ` : "";
   const lines = [
     `SELECT ${sqlServerTop}${uniqueSelect.join(", ")}`,
@@ -642,21 +745,21 @@ function analyzeExplain(planText) {
       body: "Nested loops are fine for small inputs, but expensive when the outer side has many rows.",
     },
     {
-      pattern: /\bexternal merge|disk|temp\b/i,
+      pattern: /\b(?:external merge|disk|temp)\b/i,
       severity: "high",
       cost: 16,
       title: "Sort or hash spilled to disk",
       body: "Disk spill usually means the query needs less data before sorting/hash work, better indexes, or more work memory.",
     },
     {
-      pattern: /\bfilesort|temporary\b/i,
+      pattern: /\b(?:filesort|temporary)\b/i,
       severity: "medium",
       cost: 10,
       title: "Temporary sort work",
       body: "The database is doing extra sort or temp-table work. An index matching filters and ORDER BY may help.",
     },
     {
-      pattern: /\bhash join|hash aggregate\b/i,
+      pattern: /\b(?:hash join|hash aggregate)\b/i,
       severity: "medium",
       cost: 6,
       title: "Hash operation",
@@ -772,9 +875,9 @@ function parseExplainNodes(text) {
     const actual = cleaned.match(/actual time=(\d+(?:\.\d+)?)\.\.(\d+(?:\.\d+)?)/i);
     const rows = cleaned.match(/rows=(\d+)/i);
     let severity = "good";
-    if (/\bseq scan|full table scan|external merge|disk\b/i.test(cleaned)) {
+    if (/\b(?:seq scan|full table scan|external merge|disk)\b/i.test(cleaned)) {
       severity = "high";
-    } else if (/\bnested loop|sort|hash\b/i.test(cleaned)) {
+    } else if (/\b(?:nested loop|sort|hash)\b/i.test(cleaned)) {
       severity = "medium";
     }
 
@@ -791,14 +894,15 @@ function parseExplainNodes(text) {
 }
 
 function scoreFromReport(report) {
-  return Math.max(5, Math.min(98, 100 - report.cost + Math.max(0, report.indexes.length * 3)));
+  return Math.max(5, Math.min(98, 100 - report.cost));
 }
 
 function renderReport(report) {
   const score = scoreFromReport(report);
-  const scoreColor = score > 78 ? "#0f766e" : score > 55 ? "#b7791f" : "#b42318";
   scoreValue.textContent = score;
-  scoreRing.style.background = `conic-gradient(${scoreColor} ${score}%, #e2e8f0 0%)`;
+  scoreRing.style.setProperty("--score", `${score}%`);
+  scoreRing.classList.remove("good", "warn", "bad");
+  scoreRing.classList.add(score > 78 ? "good" : score > 55 ? "warn" : "bad");
   scoreTitle.textContent = score > 78 ? "Healthy shape" : score > 55 ? "Worth tuning" : "Needs attention";
   scoreText.textContent =
     score > 78
@@ -963,7 +1067,7 @@ function emptyState(title, body) {
 }
 
 function runOptimizer() {
-  lastReport = analyzeSql(sqlInput.value, schemaInput.value, dialectInput.value);
+  lastReport = analyzeSql(sqlInput.value, schemaInput.value, dialectInput.value, explainInput.value);
   renderReport(lastReport);
 }
 
@@ -1008,11 +1112,11 @@ function loadHistoryEntry(index) {
   if (!entry) {
     return;
   }
-  dialectInput.value = entry.dialect;
-  sqlInput.value = entry.sql;
-  schemaInput.value = entry.schema;
-  intentInput.value = entry.intent;
-  explainInput.value = entry.explain;
+  dialectInput.value = entry.dialect || "postgres";
+  sqlInput.value = entry.sql || "";
+  schemaInput.value = entry.schema || "";
+  intentInput.value = entry.intent || "";
+  explainInput.value = entry.explain || "";
   updateStats();
   runOptimizer();
 }
@@ -1041,6 +1145,7 @@ sampleButton.addEventListener("click", () => {
 });
 
 optimizeButton.addEventListener("click", runOptimizer);
+dialectInput.addEventListener("change", runOptimizer);
 saveRunButton.addEventListener("click", saveCurrentRun);
 
 buildQueryButton.addEventListener("click", () => {
@@ -1053,21 +1158,25 @@ analyzeExplainButton.addEventListener("click", runOptimizer);
 
 copyButton.addEventListener("click", async () => {
   const text = optimizedOutput.textContent;
-  if (navigator.clipboard && window.isSecureContext) {
-    await navigator.clipboard.writeText(text);
-  } else {
-    const helper = document.createElement("textarea");
-    helper.value = text;
-    helper.setAttribute("readonly", "");
-    helper.style.position = "fixed";
-    helper.style.opacity = "0";
-    document.body.append(helper);
-    helper.select();
-    document.execCommand("copy");
-    helper.remove();
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const helper = document.createElement("textarea");
+      helper.value = text;
+      helper.setAttribute("readonly", "");
+      helper.style.position = "fixed";
+      helper.style.opacity = "0";
+      document.body.append(helper);
+      helper.select();
+      document.execCommand("copy");
+      helper.remove();
+    }
+    copyButton.textContent = "Copied";
+  } catch {
+    copyButton.textContent = "Copy failed";
   }
 
-  copyButton.textContent = "Copied";
   window.setTimeout(() => {
     copyButton.innerHTML =
       '<span class="icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="5.5" y="5.5" width="8" height="8" rx="1.3" stroke="currentColor" stroke-width="1.3"/><path d="M3.5 10.2V3.8A1.3 1.3 0 0 1 4.8 2.5h6.4" stroke="currentColor" stroke-width="1.3"/></svg></span> Copy';

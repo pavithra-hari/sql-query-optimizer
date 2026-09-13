@@ -278,9 +278,22 @@ textarea {
   width: 118px;
   aspect-ratio: 1;
   border-radius: 50%;
-  /* JS sets the conic-gradient inline on every render; this is just the pre-render fallback fill. */
-  background: var(--ring-track);
+  --score: 0%;
+  --score-color: var(--red);
+  background: conic-gradient(var(--score-color) var(--score), var(--ring-track) 0);
   position: relative;
+}
+
+.score-ring.good {
+  --score-color: var(--green);
+}
+
+.score-ring.warn {
+  --score-color: var(--amber);
+}
+
+.score-ring.bad {
+  --score-color: var(--red);
 }
 
 .score-ring::after {
